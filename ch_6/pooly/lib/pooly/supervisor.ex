@@ -11,6 +11,7 @@ defmodule Pooly.Supervisor do
     ]
 
     opts = [strategy: :one_for_all]
+
     supervise(children, opts)
   end
 end

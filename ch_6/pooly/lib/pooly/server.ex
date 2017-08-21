@@ -3,33 +3,43 @@ defmodule Pooly.Server do
   import Supervisor.Spec
 
   defmodule State do
-    defstruct supervisor: nil,
-              monitors: nil,
-              worker_supervisor: nil,
-              workers: nil,
-              size: nil,
-              mfa: nil
+    defstruct [
+      :supervisor, 
+      :size, 
+      :mfa, 
+      :monitors,
+      :worker_supervisor,
+      :workers
+    ]
   end
 
   #######
   # API #
   #######
-
+  
   def start_link(supervisor, pool_config) do
-    GenServer.start_link(
-      __MODULE__, 
-      [supervisor, pool_config],
-      name: __MODULE__
-    )
+    GenServer.start_link(__MODULE__, [supervisor, pool_config], name: __MODULE__)
   end
+
+  def checkout do
+    GenServer.call(__MODULE__, :checkout)
+  end
+
+  def checkin(worker) do
+    GenServer.cast(__MODULE__, {:checkin, worker})
+  end
+
+  def status do
+    GenServer.call(__MODULE__, :status)
+  end
+
+  #############
+  # Callbacks #
+  #############
 
   def init([supervisor, pool_config]) when is_pid(supervisor) do
     monitors = :ets.new(:monitors, [:private])
-
-    init(pool_config, %State{
-      supervisor: supervisor, 
-      monitors: monitors
-    })
+    init(pool_config, %State{supervisor: supervisor, monitors: monitors})
   end
 
   def init([{:mfa, mfa} | rest], state) do
@@ -49,59 +59,32 @@ defmodule Pooly.Server do
     {:ok, state}
   end
 
-  ## Borrow a worker
-  def checkout do
-    GenServer.call(__MODULE__, :checkout)
-  end
-
-  ## Return back a worker
-  def checkin(worker) do
-    GenServer.cast(__MODULE__, {:checkin, worker})
-  end
-
-  def status do
-    GenServer.call(__MODULE__, :status)
-  end
-
-  #############
-  # Callbacks #
-  #############
-  
-  def handle_info(:start_worker_supervisor, state = %State{
-    supervisor: supervisor,
-    mfa: mfa,
-    size: size
-  }) do
-    {:ok, worker_supervisor} = Supervisor.start_child(supervisor, worker_supervisor_spec(mfa))
+  def handle_info(:start_worker_supervisor, state = %{supervisor: supervisor, mfa: mfa, size: size}) do
+    {:ok, worker_supervisor} = Supervisor.start_child(supervisor, supervisor_spec(mfa))
     workers = prepopulate(size, worker_supervisor)
-
-    {:noreply, %{state | worker_supervisor: worker_supervisor,
-                         workers: workers}}
+    {:noreply, %{state | worker_supervisor: worker_supervisor, workers: workers}}
   end
 
-  def handle_call(:checkout, {borrower, _ref}, %State{
-    workers: workers,
-    monitors: monitors
-  } = state) do
+  def handle_call(:checkout, {borrower, reference}, %{workers: workers, monitors: monitors} = state) do
     case workers do
-      [worker | idle_workers] ->
-        borrower_monitor = Process.monitor(borrower)
-
-        true = :ets.insert(monitors, {worker, borrower_monitor})
-        {:reply, worker, %{state | workers: idle_workers}}
+      [worker | rest] ->
+        reference = Process.monitor(borrower)
+        true = :ets.insert(monitors, {worker, reference})
+        {:reply, worker, %{state | workers: rest}}
 
       [] ->
         {:reply, :noproc, state}
     end
   end
 
-  def handle_call({:checkin, worker}, %{
-    workers: workers,
-    monitors: monitors
-  } = state) do
+  def handle_call(:status, _from, %{workers: workers, monitors: monitors} = state) do
+    {:reply, {length(workers), :ets.info(monitors, :size)}, state}
+  end
+
+  def handle_cast({:checkin, worker}, %{workers: workers, monitors: monitors} = state) do
     case :ets.lookup(monitors, worker) do
-      [{^worker, borrower_monitor}] ->
-        true = Process.demonitor(borrower_monitor)
+      [{^worker, reference}] ->
+        true = Process.demonitor(reference)
         true = :ets.delete(monitors, worker)
         {:noreply, %{state | workers: [worker | workers]}}
 
@@ -110,18 +93,11 @@ defmodule Pooly.Server do
     end
   end
 
-  def handle_call(:status, _from, %{
-    workers: workers,
-    monitors: monitors
-  } = state) do
-    {:reply, {length(workers), :ets.info(monitors, :size)}, state}
-  end
-
   #####################
   # Private Functions #
   #####################
 
-  defp worker_supervisor_spec(mfa) do
+  defp supervisor_spec(mfa) do
     opts = [restart: :temporary]
     supervisor(Pooly.WorkerSupervisor, [mfa], opts)
   end
@@ -142,5 +118,4 @@ defmodule Pooly.Server do
     {:ok, worker} = Supervisor.start_child(worker_supervisor, [[]])
     worker
   end
-
 end
