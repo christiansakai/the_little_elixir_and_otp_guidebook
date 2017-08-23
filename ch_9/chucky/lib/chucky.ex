@@ -4,6 +4,7 @@ defmodule Chucky do
 
   def start(type, _rags) do
     import Supervisor.Spec
+
     children = [
       worker(Chucky.Server, [])
     ]

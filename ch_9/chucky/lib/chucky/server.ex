@@ -24,7 +24,7 @@ defmodule Chucky.Server do
     :random.seed(:os.timestamp)
     facts = 
       "facts.txt"
-      |> File.read!
+      |> File.read!()
       |> String.split("\n")
       |> Enum.filter(&(&1 != ""))
 
@@ -34,8 +34,8 @@ defmodule Chucky.Server do
   def handle_call(:fact, _From, facts) do
     random_fact =
       facts
-      |> Enum.shuffle
-      |> List.first
+      |> Enum.shuffle()
+      |> List.first()
 
     {:reply, random_fact, facts}
   end
