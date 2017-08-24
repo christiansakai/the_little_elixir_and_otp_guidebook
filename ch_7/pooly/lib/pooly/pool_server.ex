@@ -10,7 +10,10 @@ defmodule Pooly.PoolServer do
       :size,
       :workers,
       :name,
-      :mfa
+      :mfa,
+      :overflow,
+      :max_overflow,
+      :waiting
     ]
   end
 
@@ -56,6 +59,10 @@ defmodule Pooly.PoolServer do
     init(rest, %{state | size: size})
   end
 
+  def init([{:max_overflow, max_overflow} | rest], state) do
+    init(rest, %{state | max_overflow: max_overflow})
+  end
+
   def init([_ | rest], state) do
     init(rest, state)
   end
@@ -65,12 +72,23 @@ defmodule Pooly.PoolServer do
     {:ok, state}
   end
 
-  def handle_call(:checkout, {borrower, reference}, %{workers: workers, monitors: monitors} = state) do
+  def handle_call({:checkout, block}, {borrower, _reference} = from, state) do
+    %{worker_supervisor: worker_supervisor,
+      workers: workers,
+      monitors: monitors,
+      overflow: overflow,
+      max_overflow: max_overflow} = state
+
     case workers do
       [worker | rest] ->
         reference = Process.monitor(borrower)
         true = :ets.insert(monitors, {worker, reference})
         {:reply, worker, %{state | workers: rest}}
+
+      [] when max_overflow > 0 and overflow < max_overflow ->
+        {worker, ref} = new_worker(worker_supervisor, borrower)
+        true = :ets.insert(monitors, {worker, ref})
+        {:reply, worker, %{state | overflow: overflow + 1}}
 
       [] ->
         {:reply, :noproc, state}
@@ -78,7 +96,7 @@ defmodule Pooly.PoolServer do
   end
 
   def handle_call(:status, _from, %{workers: workers, monitors: monitors} = state) do
-    {:reply, {length(workers), :ets.info(monitors, :size)}, state}
+    {:reply, {state_name(state), length(workers), :ets.info(monitors, :size)}, state}
   end
 
   def handle_cast({:checkin, worker}, %{workers: workers, monitors: monitors} = state) do
@@ -86,7 +104,8 @@ defmodule Pooly.PoolServer do
       [{^worker, reference}] ->
         true = Process.demonitor(reference)
         true = :ets.delete(monitors, worker)
-        {:noreply, %{state | workers: [worker | workers]}}
+        new_state = handle_checkin(worker, state)
+        {:noreply, new_state}
 
       [] ->
         {:noreply, state}
@@ -116,7 +135,7 @@ defmodule Pooly.PoolServer do
       [{^worker, reference}] ->
         true = Process.demonitor(reference)
         true = :ets.delete(monitors, worker)
-        new_state = %{state | workers: [new_worker(pool_supervisor) | workers]}
+        new_state = handle_worker_exit(worker, state)
         {:noreply, new_state}
 
       [[]] ->
@@ -160,6 +179,61 @@ defmodule Pooly.PoolServer do
   defp supervisor_spec(name, mfa) do
     opts = [id: name <> "WorkerSupervisor", restart: :temporary]
     supervisor(Pooly.WorkerSupervisor, [self(), mfa], opts)
+  end
+
+  defp handle_checkin(worker, state) do
+    %{worker_supervisor: worker_supervisor,
+      workers: workers,
+      monitors: monitors,
+      overflow: overflow} = state
+
+    if overflow > 0 do
+      :ok = dismiss_worker(worker_supervisor, pid)
+      %{state | waiting: empty, overflow: overflow - 1}
+    else
+      %{state | waiting: empty, workers: [pid | workers], overflow: 0}
+    else
+    end
+  end
+
+  defp dismiss_worker(worker_supervisor, worker) do
+    true = Process.unlink(worker)
+    Supervisor.terminate_child(worker_supervisor, worker)
+  end
+
+  defp handle_worker_exit(worker, state) do
+    %{worker_supervisor: worker_supervisor,
+      workers: workers,
+      monitors: monitors,
+      overflow: overflow} = state
+
+    if overflow > 0 do
+      %{state | overflow: overflow - 1}
+    else
+      %{state | workers: [new_worker(worker_supervisor) | workers]}
+    end
+  end
+
+  defp state_name(%State{overflow: overflow, max_overflow: max_overflow, workers: workers}) when overflow < 1 do
+    case length(workers) == 0 do
+      true ->
+        if max_overflow < 1 do
+          :full
+        else
+          :overflow
+        end
+
+      false ->
+        :ready
+    end
+  end
+
+  defp state_name(%State{overflow: max_overflow, max_overflow: max_overflow}) do
+    :full
+  end
+
+  defp state_name(_state) do
+    :overflow
   end
 
 end
