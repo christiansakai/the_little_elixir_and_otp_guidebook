@@ -25,8 +25,8 @@ defmodule Pooly.PoolServer do
     GenServer.start_link(__MODULE__, [pool_supervisor, pool_config], name: name(pool_config[:name]))
   end
 
-  def checkout(pool_name) do
-    GenServer.call(name(pool_name), :checkout)
+  def checkout(pool_name, block, timeout) do
+    GenServer.call(name(pool_name), {:checkout, block}, timeout)
   end
 
   def checkin(pool_name, worker) do
@@ -44,7 +44,9 @@ defmodule Pooly.PoolServer do
   def init([pool_supervisor, pool_config]) when is_pid(pool_supervisor) do
     Process.flag(:trap_exit, true)
     monitors = :ets.new(:monitors, [:private])
-    init(pool_config, %State{pool_supervisor: pool_supervisor, monitors: monitors})
+    waiting = :queue.new
+    state = %State{pool_supervisor: pool_supervisor, monitors: monitors, waiting: waiting, overflow: 0}
+    init(pool_config, state)
   end
 
   def init([{:name, name} | rest], state) do
@@ -76,6 +78,7 @@ defmodule Pooly.PoolServer do
     %{worker_supervisor: worker_supervisor,
       workers: workers,
       monitors: monitors,
+      waiting: waiting,
       overflow: overflow,
       max_overflow: max_overflow} = state
 
@@ -90,8 +93,13 @@ defmodule Pooly.PoolServer do
         true = :ets.insert(monitors, {worker, ref})
         {:reply, worker, %{state | overflow: overflow + 1}}
 
+      [] when block == true ->
+        ref = Process.monitor(borrower)
+        waiting = :queue.in({from, ref}, waiting)
+        {:noreply, %{state | waiting: waiting}, :infinity}
+
       [] ->
-        {:reply, :noproc, state}
+        {:reply, :full, state}
     end
   end
 
@@ -185,14 +193,21 @@ defmodule Pooly.PoolServer do
     %{worker_supervisor: worker_supervisor,
       workers: workers,
       monitors: monitors,
+      waiting: waiting,
       overflow: overflow} = state
 
-    if overflow > 0 do
-      :ok = dismiss_worker(worker_supervisor, pid)
-      %{state | waiting: empty, overflow: overflow - 1}
-    else
-      %{state | waiting: empty, workers: [pid | workers], overflow: 0}
-    else
+    case :queue.out(waiting) do
+      {{:value, {borrower, ref}}, left} ->
+        true = :ets.insert(monitors, {worker, ref})
+        GenServer.reply(borrower, worker)
+        %{state | waiting: left}
+
+      {:empty, empty} when overflow > 0 ->
+        :ok = dismiss_worker(worker_supervisor, worker)
+        %{state | waiting: empty, overflow: overflow - 1}
+
+      {:empty, empty} ->
+        %{state | waiting: empty, workers: [worker | workers], overflow: 0}
     end
   end
 
@@ -205,12 +220,21 @@ defmodule Pooly.PoolServer do
     %{worker_supervisor: worker_supervisor,
       workers: workers,
       monitors: monitors,
+      waiting: waiting,
       overflow: overflow} = state
 
-    if overflow > 0 do
-      %{state | overflow: overflow - 1}
-    else
-      %{state | workers: [new_worker(worker_supervisor) | workers]}
+    case :queue.out(waiting) do
+      {{:value, {borrower, ref}}, left} ->
+        new_worker = new_worker(worker_supervisor)
+        true = :ets.insert(monitors, {new_worker, ref})
+        GenServer.reply(borrower, new_worker)
+
+      {:empty, empty} when overflow > 0 ->
+        %{state | overflow: overflow - 1, waiting: empty}
+
+      {:empty, empty} ->
+        workers = [new_worker(worker_supervisor) | workers]
+        %{state | workers: workers, waiting: empty}
     end
   end
 
@@ -234,6 +258,18 @@ defmodule Pooly.PoolServer do
 
   defp state_name(_state) do
     :overflow
+  end
+
+  defp new_worker(sup) do
+    {:ok, worker} = Supervisor.start_child(sup, [[]])
+    true = Process.link(worker)
+    worker
+  end
+
+  defp new_worker(sup, from_pid) do
+    pid = new_worker(sup)
+    ref = Process.monitor(from_pid)
+    {pid, ref}
   end
 
 end
